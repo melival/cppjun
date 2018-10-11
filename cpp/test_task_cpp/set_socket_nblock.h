@@ -1,5 +1,5 @@
-#ifndef __SET_SOCKET_NONBLOCK__
-#define __SET_SOCKET_NONBLOCK__
+#if defined(set_nonblock)
+#else
 
 int set_nonblock(int fd)
 {

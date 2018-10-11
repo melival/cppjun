@@ -1,6 +1,7 @@
 #include <iostream>
 #include <set>
 #include <algorithm>
+#include <thread>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -8,82 +9,97 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-//#include "TZinfo.h"
 #include "TZinfo.hpp"
-
 #include "set_socket_nblock.h"
+#include "create_response.hpp"
+
+const int MasterSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+const int default_port_number = 12345;
+const std::string default_tz_if_path="tzones.txt";
+static bool server_on_air = true;
 
 
-/*class server {
-private:
-	int MasterSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-/*
-int optval = 1;
-setsockopt(MasterSocket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
-*/
-/*
-public:
-	server() {
-		struct sockaddr_in SockAddr;
-		SockAddr.sin_family = AF_INET;
-		SockAddr.sin_port = htons(12345);
-		SockAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+std::set<int> SlaveSockets;
+TZinfo ti;
 
-		bind(MasterSocket, (struct sockaddr *) (&SockAddr), sizeof(SockAddr));
-		set_nonblock(MasterSocket);
-
-		listen(MasterSocket, SOMAXCONN);
-
-	}
-
-};
-
-class sessions {
-private:
-public:
-	std::set<int> sockets;
-
-	sessions() {}
-};
-*/
-
-std::string create_response_ctime(std::string z, int o){
-    using namespace std;
-    string result;
-    time_t t = time(0) + o;
-    result += ctime(&t);
-    result.insert(result.size() - 5, z + " ");
-    return result;
-}
-
+bool load_timezones_base(std::string tz_if_path=default_tz_if_path);
+void init_listener(const int port_number=default_port_number);
+void main_loop();
+void server_cli();
+void command_interpreter(std::string);
 
 int main(int argc, char ** argv){
+	//Timezone base loading...
+	std::cout << "Timezone server v0.1." << std::endl;
+	std::cout << "Type 'man' for manual." << std::endl;
 
-	TZinfo ti;
-	std::cout << "Loading timezones... ";
-	if (ti.load_base("tzones.txt") < 0) {
-		std::cout << "Open info file error." << std::endl;
-		return 1;
-	} else if (ti.get_count() > 0) {
-		std::cout << ti.get_count() << " items loaded." << std::endl;
+	if(!load_timezones_base()) { return 1; }
+
+	//Setting up the server
+	if(argc == 2 && isdigit(argv[1][0])) {
+		init_listener(atoi(argv[1]));
 	} else {
-		std::cout << "Timezones in file not found." << std::endl;
+		init_listener();
 	}
 
-	int MasterSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	std::set<int> SlaveSockets;
+	std::thread (main_loop).detach();
+
+	std::thread server_cli_thread(server_cli);
+	server_cli_thread.join();
+
+	return 0;
+}
+
+void server_cli() {
+	std::string server_command;
+	while (server_on_air) {
+		std::cin >> server_command;
+		command_interpreter(server_command);
+	}
+}
+
+void command_interpreter(std::string cmd) {
+	if ( cmd == "quit" ) { 
+		server_on_air = false; 
+	} else if ( cmd == "man" || cmd == "help" ) {
+		std::cout << "for quit type 'quit'" << std::endl;
+	}
+}
+
+bool load_timezones_base(std::string tz_if_path) {
+	std::cout << "Loading timezones... ";
+
+	while( ti.load_base(tz_if_path) <= 0 ) {
+		if (!server_on_air) return false;
+		std::cout << "Can't load information about timezones offsets."
+		<< std::endl << "Please specify path and name for infofile:";
+		std::cin >> tz_if_path;
+		command_interpreter(tz_if_path);
+	}
+
+	std::cout << ti.get_count() << " items loaded." << std::endl;
+	return true;
+}
+
+void init_listener(const int port_number) {
+
+	std::cout << "open server on " 
+			<< ( (port_number == default_port_number)?"default":"custom" )
+			<< " port number: " << port_number << std::endl;
 
 	struct sockaddr_in SockAddr;
 	SockAddr.sin_family = AF_INET;
-	SockAddr.sin_port = htons(12345);
+	SockAddr.sin_port = htons(port_number);
 	SockAddr.sin_addr.s_addr = htonl(INADDR_ANY);
 
 	bind(MasterSocket, (struct sockaddr *)(&SockAddr), sizeof(SockAddr));
 
 	set_nonblock(MasterSocket);
 	listen(MasterSocket, SOMAXCONN);
-	
-	while(true){
+}
+
+void main_loop() {
+	while(server_on_air){
 		fd_set Set;
 		FD_ZERO(&Set);
 		FD_SET(MasterSocket, &Set);
@@ -91,7 +107,7 @@ int main(int argc, char ** argv){
 			FD_SET(*ss, &Set);
 		}
 
-		int last_socket = std::max(MasterSocket, 
+		int last_socket = std::max(MasterSocket,
 				*std::max_element(SlaveSockets.begin(),
 				SlaveSockets.end()));
 
@@ -106,14 +122,14 @@ int main(int argc, char ** argv){
 					close(*ss);
 					SlaveSockets.erase(ss);
 				} else if(RecvSize != 0){
-					for(int i = 0; i < RecvSize; i++) 
+					//cleaning from request nonALPHABETH chars 
+					for(int i = 0; i < RecvSize; i++)
 						if(Buffer[i] < 'A' || Buffer[i] > 'Z')
 							Buffer[i] = '\0';
-						
 					std::string msg(Buffer);
-					std::cout << msg << std::endl;
+					//std::cout << msg << std::endl; //logging incoming messages
 					if (ti.find_zone(msg) > 0) {
-						msg = create_response_ctime(msg, ti.get_offset(msg));
+						msg = tztime_cr::make(msg, ti.get_offset(msg));
 					} else {
 						msg = "Unknown timezone\n";
 					}
@@ -128,6 +144,4 @@ int main(int argc, char ** argv){
 			SlaveSockets.insert(SlaveSocket);
 		}
 	}
-
-	return 0;
 }
